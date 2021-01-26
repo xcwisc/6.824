@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -50,6 +52,17 @@ func TestInitialElection2A(t *testing.T) {
 	cfg.end()
 }
 
+func helper(cfg *config) {
+	ms := 450 + (rand.Int63() % 100)
+	time.Sleep(time.Duration(ms) * time.Millisecond)
+
+	for i := 0; i < cfg.n; i++ {
+		if cfg.connected[i] {
+			cfg.rafts[i].GetFullState()
+		}
+	}
+
+}
 func TestReElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)

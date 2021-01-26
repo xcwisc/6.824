@@ -86,6 +86,11 @@ func (rf *Raft) GetState() (int, bool) {
 	return currentTerm, isleader
 }
 
+func (rf *Raft) GetFullState() {
+	DPrintf("me: %v, currentRole: %v, currentTerm: %v, voteFor: %v, currentVote: %v",
+		rf.me, rf.currentRole, rf.currentTerm, rf.voteFor, rf.currentVote)
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -156,13 +161,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.voteFor == -1 || rf.voteFor == args.CandidateId {
+	if args.Term != rf.currentTerm || rf.voteFor == -1 || rf.voteFor == args.CandidateId {
 		reply.VoteGranted = true
 		rf.voteFor = args.CandidateId
 		rf.currentTerm = args.Term
 		return
 	}
-
 	reply.VoteGranted = false
 	return
 }
