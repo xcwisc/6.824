@@ -17,14 +17,17 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -43,6 +46,13 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+// enum of 3 roles in candiate election
+const (
+	Leader    = "Leader"
+	Follower  = "Follower"
+	Candidate = "Candidate"
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -56,17 +66,24 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	currentRole   string    // the current role of this server
+	currentTerm   int       // the latest term the server has seen
+	voteFor       int       // candidateid for current term
+	lastHeartbeat time.Time // the last time the server hear a heartbeat from the leader
+	currentVote   int       // the number of votes gathered
+	// log
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	currentTerm := rf.currentTerm
+	isleader := rf.currentRole == Leader
+	return currentTerm, isleader
 }
 
 //
@@ -84,7 +101,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -108,30 +124,47 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
+// RequestVote RPC arguments structure.
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int
+	CandidateId int
 }
 
 //
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
+//  RequestVote RPC reply structure.
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
-// example RequestVote RPC handler.
+// RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		reply.VoteGranted = false
+		return
+	}
+
+	if rf.voteFor == -1 || rf.voteFor == args.CandidateId {
+		reply.VoteGranted = true
+		rf.voteFor = args.CandidateId
+		rf.currentTerm = args.Term
+		return
+	}
+
+	reply.VoteGranted = false
+	return
 }
 
 //
@@ -163,11 +196,85 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	for ok := rf.peers[server].Call("Raft.RequestVote", args, reply); !ok; {
+		// keep retrying to send the RPC unless one of the two conditions is met
+		// 1. the current candidate got enough votes
+		// 2. the current term is larger than the term in args (other candidate has got the vote or elapse time run out)
+		rf.mu.Lock()
+		if rf.currentVote*2 > len(rf.peers) || rf.currentTerm > args.Term {
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+	}
+
+	// at this point, call to RequestVote is successful and this thread is not holding a lock
+	// we should then do reply processing
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	VoteGranted := reply.VoteGranted
+	if VoteGranted {
+		rf.currentVote++
+		if rf.currentVote*2 > len(rf.peers) && rf.currentRole == Candidate {
+			// this server should be the new leader and send initial heartbeat (empty AppendEntries)
+			rf.currentRole = Leader
+			rf.sendHeartBeat()
+		}
+	} else {
+		term := reply.Term
+		if rf.currentTerm < term {
+			rf.currentTerm = term
+			rf.currentRole = Follower
+		}
+	}
 }
 
+//
+// AppendEntries RPC arguments structure.
+//
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+}
+
+//
+//  AppendEntries RPC reply structure.
+//
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+//
+// AppendEntries RPC handler.
+//
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.lastHeartbeat = time.Now()
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		reply.Success = false
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	if ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		term := reply.Term
+		if term > rf.currentTerm {
+			rf.currentTerm = term
+			rf.currentRole = Follower
+		}
+	}
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -189,7 +296,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -215,6 +321,64 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func getRandElectionTimeout(min, max int) time.Duration {
+	rand.Seed(time.Now().UnixNano())
+	return time.Duration(rand.Intn(max-min+1)+min) * time.Millisecond
+}
+
+// this function periodically check if the leader has not
+// send a heartbeat or granting vote to candidate
+func (rf *Raft) checkElectionTimeout() {
+	for {
+		rf.mu.Lock()
+		if rf.currentRole == Follower || rf.currentRole == Candidate {
+			lastHeartbeat := rf.lastHeartbeat
+			elapsed := time.Since(lastHeartbeat)
+			electionTimeout := getRandElectionTimeout(500, 750)
+			if elapsed > electionTimeout {
+				// now this server should be a candidate for a new election
+				rf.currentRole = Candidate
+				rf.currentTerm++
+				rf.voteFor = rf.me
+				rf.currentVote = 1
+				rf.lastHeartbeat = time.Now()
+
+				for i := range rf.peers {
+					if i == rf.me {
+						continue
+					}
+
+					args := &RequestVoteArgs{
+						Term:        rf.currentTerm,
+						CandidateId: rf.me,
+					}
+					reply := &RequestVoteReply{}
+					go rf.sendRequestVote(i, args, reply)
+				}
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// this function be periodically called to send heartbeats if the current server is a leader
+// note that this method is not thread safe, so locking is required to call this function
+func (rf *Raft) sendHeartBeat() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		args := &AppendEntriesArgs{
+			Term:     rf.currentTerm,
+			LeaderId: rf.me,
+		}
+		reply := &AppendEntriesReply{}
+		go rf.sendAppendEntries(i, args, reply)
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -232,12 +396,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.currentRole = Follower
+	rf.currentTerm = 0
+	rf.lastHeartbeat = time.Now()
+	rf.voteFor = -1
 
 	// Your initialization code here (2A, 2B, 2C).
+	go rf.checkElectionTimeout()
+
+	// this goroutine is reponsible for sending heartbeats if the current server is a leader
+	go func(rf *Raft) {
+		for {
+			rf.mu.Lock()
+			if rf.currentRole == Leader {
+				rf.sendHeartBeat()
+			}
+			rf.mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+		}
+	}(rf)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
