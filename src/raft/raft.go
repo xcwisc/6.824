@@ -129,6 +129,30 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+// convertToCandidate convert the current server to candidate and start an election
+// the caller should hold a lock
+func (rf *Raft) convertToCandidate() {
+	rf.currentRole = Candidate
+	rf.currentTerm++
+	rf.voteFor = rf.me
+	rf.currentVote = 1
+	rf.lastHeartbeat = time.Now()
+
+	// send RequestVote RPC calls to other servers to inform them the start of election
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		args := &RequestVoteArgs{
+			Term:        rf.currentTerm,
+			CandidateId: rf.me,
+		}
+		reply := &RequestVoteReply{}
+		go rf.sendRequestVote(i, args, reply)
+	}
+}
+
 //
 // RequestVote RPC arguments structure.
 //
@@ -163,6 +187,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term != rf.currentTerm || rf.voteFor == -1 || rf.voteFor == args.CandidateId {
 		reply.VoteGranted = true
+		rf.lastHeartbeat = time.Now()
 		rf.voteFor = args.CandidateId
 		rf.currentTerm = args.Term
 		return
@@ -171,35 +196,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	return
 }
 
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
 // Call() sends a request and waits for a reply. If a reply arrives
 // within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
+// Call() returns false.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	for ok := rf.peers[server].Call("Raft.RequestVote", args, reply); !ok; {
 		// keep retrying to send the RPC unless one of the two conditions is met
@@ -214,17 +213,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	}
 
 	// at this point, call to RequestVote is successful and this thread is not holding a lock
-	// we should then do reply processing
+	// we should then process the reply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	VoteGranted := reply.VoteGranted
 	if VoteGranted {
 		rf.currentVote++
-		if rf.currentVote*2 > len(rf.peers) && rf.currentRole == Candidate {
+		if rf.currentVote*2 > len(rf.peers) && rf.currentRole == Candidate && args.Term == rf.currentTerm {
 			// this server should be the new leader and send initial heartbeat (empty AppendEntries)
 			rf.currentRole = Leader
-			rf.sendHeartBeat()
+			rf.sendHeartBeats()
 		}
 	} else {
 		term := reply.Term
@@ -258,11 +257,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.lastHeartbeat = time.Now()
 	reply.Term = rf.currentTerm
 	if rf.currentTerm > args.Term {
 		reply.Success = false
 	}
+
+	rf.lastHeartbeat = time.Now()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -339,26 +339,11 @@ func (rf *Raft) checkElectionTimeout() {
 			lastHeartbeat := rf.lastHeartbeat
 			elapsed := time.Since(lastHeartbeat)
 			electionTimeout := getRandElectionTimeout(500, 750)
+
 			if elapsed > electionTimeout {
-				// now this server should be a candidate for a new election
-				rf.currentRole = Candidate
-				rf.currentTerm++
-				rf.voteFor = rf.me
-				rf.currentVote = 1
-				rf.lastHeartbeat = time.Now()
-
-				for i := range rf.peers {
-					if i == rf.me {
-						continue
-					}
-
-					args := &RequestVoteArgs{
-						Term:        rf.currentTerm,
-						CandidateId: rf.me,
-					}
-					reply := &RequestVoteReply{}
-					go rf.sendRequestVote(i, args, reply)
-				}
+				// this means the current term is over due to slight randomized electionTimeout
+				// now this server should start an election
+				rf.convertToCandidate()
 			}
 		}
 		rf.mu.Unlock()
@@ -368,7 +353,7 @@ func (rf *Raft) checkElectionTimeout() {
 
 // this function be periodically called to send heartbeats if the current server is a leader
 // note that this method is not thread safe, so locking is required to call this function
-func (rf *Raft) sendHeartBeat() {
+func (rf *Raft) sendHeartBeats() {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -406,6 +391,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteFor = -1
 
 	// Your initialization code here (2A, 2B, 2C).
+
+	// this goroutine is responsible for checking if leader is dead (haven't sent a heartbeat longer than ElectionTimeout)
 	go rf.checkElectionTimeout()
 
 	// this goroutine is reponsible for sending heartbeats if the current server is a leader
@@ -413,7 +400,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for {
 			rf.mu.Lock()
 			if rf.currentRole == Leader {
-				rf.sendHeartBeat()
+				rf.sendHeartBeats()
 			}
 			rf.mu.Unlock()
 			time.Sleep(100 * time.Millisecond)
