@@ -70,7 +70,6 @@ type Raft struct {
 	currentTerm   int       // the latest term the server has seen
 	voteFor       int       // candidateid for current term
 	lastHeartbeat time.Time // the last time the server hear a heartbeat from the leader
-	currentVote   int       // the number of votes gathered
 	// log
 }
 
@@ -87,8 +86,8 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 func (rf *Raft) GetFullState() {
-	DPrintf("me: %v, currentRole: %v, currentTerm: %v, voteFor: %v, currentVote: %v",
-		rf.me, rf.currentRole, rf.currentTerm, rf.voteFor, rf.currentVote)
+	DPrintf("me: %v, currentRole: %v, currentTerm: %v, voteFor: %v",
+		rf.me, rf.currentRole, rf.currentTerm, rf.voteFor)
 }
 
 //
@@ -130,14 +129,17 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 // convertToCandidate convert the current server to candidate and start an election
-// the caller should hold a lock
 func (rf *Raft) convertToCandidate() {
+	cond := sync.NewCond(&rf.mu)
+	grantedVotes := 1
+	totalVotes := 1
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.currentRole = Candidate
 	rf.currentTerm++
 	rf.voteFor = rf.me
-	rf.currentVote = 1
+	startTerm := rf.currentTerm
 
 	// send RequestVote RPC calls to other servers to inform them the start of election
 	for i := range rf.peers {
@@ -150,8 +152,43 @@ func (rf *Raft) convertToCandidate() {
 			CandidateId: rf.me,
 		}
 		reply := &RequestVoteReply{}
-		go rf.sendRequestVote(i, args, reply)
+		go func(i int) {
+			rf.sendRequestVote(i, args, reply)
+			// at this point, call to RequestVote is successful and this thread is not holding a lock
+			// we should then process the reply
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			VoteGranted := reply.VoteGranted
+			totalVotes++
+			if VoteGranted {
+				grantedVotes++
+			} else {
+				term := reply.Term
+				if rf.currentTerm < term {
+					rf.currentTerm = term
+					rf.currentRole = Follower
+				}
+			}
+			cond.Broadcast()
+		}(i)
 	}
+
+	// wait until all the votes are collected
+	for grantedVotes*2 < len(rf.peers) && totalVotes != len(rf.peers) {
+		cond.Wait()
+	}
+
+	if grantedVotes*2 > len(rf.peers) && rf.currentRole == Candidate && startTerm == rf.currentTerm {
+		// this server should be the new leader
+		rf.convertToLeader()
+	}
+}
+
+// convertToLeader convert the current server to Leader and send initial heartbeat
+func (rf *Raft) convertToLeader() {
+	rf.currentRole = Leader
+	rf.sendHeartBeats()
 }
 
 //
@@ -206,36 +243,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // Call() returns false.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	for ok := rf.peers[server].Call("Raft.RequestVote", args, reply); !ok; {
-		// keep retrying to send the RPC unless one of the two conditions is met
-		// 1. the current candidate got enough votes
-		// 2. the current term is larger than the term in args (other candidate has got the vote or elapse time run out)
+		// keep retrying to send the RPC unless
+		// the current term is larger than the term in args (other candidate has got the vote or elapse time run out)
 		rf.mu.Lock()
-		if rf.currentVote*2 > len(rf.peers) || rf.currentTerm > args.Term {
+		if rf.currentTerm > args.Term {
+			reply.VoteGranted = false
 			rf.mu.Unlock()
 			return
 		}
 		rf.mu.Unlock()
-	}
-
-	// at this point, call to RequestVote is successful and this thread is not holding a lock
-	// we should then process the reply
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	VoteGranted := reply.VoteGranted
-	if VoteGranted {
-		rf.currentVote++
-		if rf.currentVote*2 > len(rf.peers) && rf.currentRole == Candidate && args.Term == rf.currentTerm {
-			// this server should be the new leader and send initial heartbeat (empty AppendEntries)
-			rf.currentRole = Leader
-			rf.sendHeartBeats()
-		}
-	} else {
-		term := reply.Term
-		if rf.currentTerm < term {
-			rf.currentTerm = term
-			rf.currentRole = Follower
-		}
 	}
 }
 
