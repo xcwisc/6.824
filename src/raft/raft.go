@@ -132,11 +132,12 @@ func (rf *Raft) readPersist(data []byte) {
 // convertToCandidate convert the current server to candidate and start an election
 // the caller should hold a lock
 func (rf *Raft) convertToCandidate() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.currentRole = Candidate
 	rf.currentTerm++
 	rf.voteFor = rf.me
 	rf.currentVote = 1
-	rf.lastHeartbeat = time.Now()
 
 	// send RequestVote RPC calls to other servers to inform them the start of election
 	for i := range rf.peers {
@@ -183,6 +184,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.currentTerm > args.Term {
 		reply.VoteGranted = false
 		return
+	}
+
+	if rf.currentTerm < args.Term {
+		rf.currentRole = Follower
 	}
 
 	if args.Term != rf.currentTerm || rf.voteFor == -1 || rf.voteFor == args.CandidateId {
@@ -260,6 +265,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	if rf.currentTerm > args.Term {
 		reply.Success = false
+		return
+	}
+
+	if rf.currentTerm < args.Term {
+		rf.currentRole = Follower
+		rf.currentTerm = args.Term
 	}
 
 	rf.lastHeartbeat = time.Now()
@@ -343,7 +354,8 @@ func (rf *Raft) checkElectionTimeout() {
 			if elapsed > electionTimeout {
 				// this means the current term is over due to slight randomized electionTimeout
 				// now this server should start an election
-				rf.convertToCandidate()
+				rf.lastHeartbeat = time.Now()
+				go rf.convertToCandidate()
 			}
 		}
 		rf.mu.Unlock()
