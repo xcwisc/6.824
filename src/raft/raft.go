@@ -223,15 +223,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.currentTerm < args.Term {
-		rf.currentRole = Follower
-	}
-
 	if args.Term != rf.currentTerm || rf.voteFor == -1 || rf.voteFor == args.CandidateId {
 		reply.VoteGranted = true
 		rf.lastHeartbeat = time.Now()
 		rf.voteFor = args.CandidateId
-		rf.currentTerm = args.Term
+		if rf.currentTerm < args.Term {
+			rf.currentRole = Follower
+			rf.currentTerm = args.Term
+		}
 		return
 	}
 	reply.VoteGranted = false
@@ -352,20 +351,35 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func getRandElectionTimeout(min, max int) time.Duration {
+func (rf *Raft) randElectionTimeoutGen(min, max int) (get func(currentTerm int) time.Duration) {
+	var timeout time.Duration
+	savedTerm := rf.currentTerm
 	rand.Seed(time.Now().UnixNano())
-	return time.Duration(rand.Intn(max-min+1)+min) * time.Millisecond
+	timeout = time.Duration(rand.Intn(max-min+1)+min) * time.Millisecond
+
+	get = func(currentTerm int) time.Duration {
+		if currentTerm == savedTerm {
+			return timeout
+		}
+
+		rand.Seed(time.Now().UnixNano())
+		timeout = time.Duration(rand.Intn(max-min+1)+min) * time.Millisecond
+		savedTerm = currentTerm
+		return timeout
+	}
+	return
 }
 
 // this function periodically check if the leader has not
 // send a heartbeat or granting vote to candidate
 func (rf *Raft) checkElectionTimeout() {
+	RandElectionTimeoutGen := rf.randElectionTimeoutGen(500, 750)
 	for {
 		rf.mu.Lock()
 		if rf.currentRole == Follower || rf.currentRole == Candidate {
 			lastHeartbeat := rf.lastHeartbeat
 			elapsed := time.Since(lastHeartbeat)
-			electionTimeout := getRandElectionTimeout(500, 750)
+			electionTimeout := RandElectionTimeoutGen(rf.currentTerm)
 
 			if elapsed > electionTimeout {
 				// this means the current term is over due to slight randomized electionTimeout
